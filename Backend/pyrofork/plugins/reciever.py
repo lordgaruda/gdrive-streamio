@@ -30,10 +30,9 @@ async def receive_token_pickle(client: Client, message: Message):
     await message.reply("⏳ Downloading and validating token.pickle...")
 
     # Download into memory (do NOT save to disk)
-    file_bytes = io.BytesIO()
-    await client.download_media(message, file_name=file_bytes)
-    file_bytes.seek(0)
-    raw = file_bytes.read()
+    raw = await client.download_media(message, in_memory=True)
+    if isinstance(raw, io.BytesIO):
+        raw = raw.getvalue()
 
     # Validate: must be a valid pickle containing Google OAuth2 credentials
     try:
