@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from Backend import __version__
 from Backend.fastapi.security.credentials import require_auth
-from Backend.fastapi.routes.stream_routes import router as stream_router, decay_client_failures
+from Backend.fastapi.routes.gdrive_stream_routes import router as gdrive_stream_router
 from Backend.fastapi.routes.stremio_routes import router as stremio_router
 from Backend.fastapi.routes.template_routes import (
     login_page, login_post, logout, set_theme, dashboard_page,
@@ -17,7 +17,6 @@ from Backend.fastapi.routes.api_routes import (
     delete_movie_quality_api, delete_tv_quality_api,
     delete_tv_episode_api, delete_tv_season_api,
     create_token_api, revoke_token_api, update_token_limits_api,
-    speed_test_api, speed_test_stream_api,
     get_admin_stats_api, clear_cache_api, get_dead_links_api,
     get_stream_analytics_api, clear_stream_analytics_api,
     get_subscription_plans_api, add_subscription_plan_api,
@@ -28,8 +27,8 @@ from Backend.fastapi.routes.api_routes import (
 )
 
 app = FastAPI(
-    title="Telegram Stremio Media Server",
-    description="A powerful, self-hosted Telegram Stremio Media Server built with FastAPI, MongoDB, and PyroFork seamlessly integrated with Stremio for automated media streaming and discovery.",
+    title="GDrive Stremio Media Server",
+    description="A self-hosted Google Drive Stremio Media Server built with FastAPI and MongoDB, seamlessly integrated with Stremio for automated media streaming.",
     version=__version__
 )
 
@@ -48,13 +47,8 @@ try:
 except Exception:
     pass
 
-@app.on_event("startup")
-async def _startup():
-    import asyncio
-    asyncio.create_task(decay_client_failures())
-
-# --- Include existing API routers ---
-app.include_router(stream_router)
+# --- Include API routers ---
+app.include_router(gdrive_stream_router)
 app.include_router(stremio_router)
 
 # --- Public Routes (No Authentication Required) ---
@@ -132,21 +126,6 @@ async def delete_tv_episode(tmdb_id: int, db_index: int, season: int, episode: i
 @app.delete("/api/media/delete-tv-season")
 async def delete_tv_season(tmdb_id: int, db_index: int, season: int, _: bool = Depends(require_auth)):
     return await delete_tv_season_api(tmdb_id, db_index, season)
-
-@app.get("/api/system/workloads")
-async def get_workloads(_: bool = Depends(require_auth)):
-    try:
-        from Backend.pyrofork.bot import work_loads
-        return {
-            "loads": {
-                f"bot{c + 1}": l
-                for c, (_, l) in enumerate(
-                    sorted(work_loads.items(), key=lambda x: x[1], reverse=True)
-                )
-            } if work_loads else {}
-        }
-    except Exception as e:
-        return {"loads": {}}
 
 @app.post("/api/tokens")
 async def create_token(payload: dict, _: bool = Depends(require_auth)):
@@ -240,27 +219,6 @@ async def link_token_to_user(token: str, payload: dict, _: bool = Depends(requir
         raise HTTPException(status_code=400, detail="user_id is required.")
     return await link_token_user_api(token, user_id)
 
-@app.get("/api/system/speedtest")
-async def speed_test(
-    quality_id: str = Query(...),
-    tmdb_id: int = Query(...),
-    db_index: int = Query(...),
-    media_type: str = Query(...),
-    _: bool = Depends(require_auth)
-):
-    return await speed_test_api(quality_id, tmdb_id, db_index, media_type)
-
-@app.get("/api/system/speedtest/stream")
-async def speed_test_stream(
-    quality_id: str = Query(...),
-    tmdb_id: int = Query(...),
-    db_index: int = Query(...),
-    media_type: str = Query(...),
-    _: bool = Depends(require_auth)
-):
-    return await speed_test_stream_api(quality_id, tmdb_id, db_index, media_type)
-
-
 @app.get("/api/media/rescan/search")
 async def search_media_rescan(
     media_type: str,
@@ -269,7 +227,6 @@ async def search_media_rescan(
     _: bool = Depends(require_auth)
 ):
     return await search_media_rescan_api(media_type, query, year)
-
 
 @app.post("/api/media/rescan/apply")
 async def apply_media_rescan(
@@ -280,6 +237,25 @@ async def apply_media_rescan(
     _: bool = Depends(require_auth)
 ):
     return await apply_media_rescan_api(request, tmdb_id, db_index, media_type)
+
+# --- GDrive Admin API ---
+@app.post("/api/admin/gdrive/rescan")
+async def trigger_gdrive_rescan(_: bool = Depends(require_auth)):
+    from starlette.background import BackgroundTask
+    from Backend.gdrive.ingest import run_full_ingest
+    import asyncio
+    asyncio.create_task(run_full_ingest())
+    return {"status": "Rescan started in background"}
+
+@app.get("/api/admin/gdrive/status")
+async def gdrive_status(_: bool = Depends(require_auth)):
+    from Backend import db
+    has_token = await db.load_gdrive_token() is not None
+    return {
+        "connected": has_token,
+        "movies": await db.count_movies(),
+        "tv_shows": await db.count_shows(),
+    }
 
 @app.exception_handler(401)
 async def auth_exception_handler(request: Request, exc):

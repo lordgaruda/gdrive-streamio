@@ -7,8 +7,6 @@ timezone = pytz.timezone("Asia/Kolkata")
 now = datetime.now(timezone)
 StartTime = time()
 
-
-USE_DEFAULT_ID: str = None
 db = Database()  
 
-__version__ = "2.2.0"
+__version__ = "3.0.0"

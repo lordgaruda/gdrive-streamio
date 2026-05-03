@@ -1,6 +1,6 @@
 aiofiles
 fastapi
-httpx
+httpx>=0.25.0
 motor
 parse-torrent-title
 pyrofork
@@ -9,4 +9,8 @@ pytz
 tgcrypto
 themoviedb
 uvicorn
-uv
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
+google-auth-httplib2>=0.1.1
+google-auth-oauthlib>=1.0.0
+apscheduler>=3.10.0

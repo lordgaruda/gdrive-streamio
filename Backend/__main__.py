@@ -4,16 +4,12 @@ import logging
 from traceback import format_exc
 from pyrogram import idle
 from Backend import __version__, db
-from Backend.helper.pinger import ping
 from Backend.logger import LOGGER
-from Backend.config import Telegram
+from Backend.config import Telegram, GDrive
 from Backend.fastapi import server
 from Backend.helper.pyro import restart_notification, setup_bot_commands
-from Backend.pyrofork.bot import Helper, StreamBot
-from Backend.pyrofork.clients import initialize_clients
-from Backend.pyrofork.plugins.channels import _load_channels_from_db
+from Backend.pyrofork.bot import StreamBot
 from Backend.helper.subscription_checker import subscription_checker_loop
-from Backend.helper.link_checker import DeadLinkChecker
 from Backend.fastapi.main import app
 
 
@@ -21,7 +17,7 @@ loop = get_event_loop()
 
 async def start_services():
     try:
-        LOGGER.info(f"Initializing Telegram-Stremio v-{__version__}")
+        LOGGER.info(f"Initializing GDrive-Stremio v-{__version__}")
         await asleep(1.2)
         
         await db.connect()
@@ -32,34 +28,44 @@ async def start_services():
         LOGGER.info(f"Bot Client : [@{StreamBot.username}]")
         await asleep(1.2)
 
-        await Helper.start()
-        Helper.username = Helper.me.username
-        LOGGER.info(f"Helper Bot Client : [@{Helper.username}]")
-        await asleep(1.2)
-
-        LOGGER.info("Initializing Multi Clients...")
-        await initialize_clients()
-        await asleep(2)
-
-        await _load_channels_from_db()
-        await asleep(2)
-        
         await setup_bot_commands(StreamBot)
-        await asleep(2)
+        await asleep(1)
 
-        LOGGER.info('Initializing Telegram-Stremio Web Server...')
+        # Start GDrive scheduled scanning
+        token = await db.load_gdrive_token()
+        if token:
+            LOGGER.info("token.pickle found in DB — starting initial Drive scan")
+            from Backend.gdrive.ingest import run_full_ingest
+            loop.create_task(run_full_ingest())
+        else:
+            LOGGER.info("No token.pickle in DB yet — send it to the Telegram bot to connect Drive")
+
+        # Schedule periodic rescans
+        async def periodic_rescan():
+            while True:
+                await asleep(GDrive.SCAN_INTERVAL_HOURS * 3600)
+                try:
+                    t = await db.load_gdrive_token()
+                    if t:
+                        LOGGER.info("Running scheduled GDrive rescan...")
+                        from Backend.gdrive.ingest import run_full_ingest
+                        await run_full_ingest()
+                    else:
+                        LOGGER.info("Skipping scheduled scan — Drive not configured")
+                except Exception as e:
+                    LOGGER.error(f"Scheduled rescan error: {e}")
+
+        loop.create_task(periodic_rescan())
+
+        LOGGER.info('Initializing GDrive-Stremio Web Server...')
         await restart_notification()
         loop.create_task(server.serve())
-        loop.create_task(ping())
-        
-        link_checker_task = DeadLinkChecker(db, app, check_interval_hours=24)
-        loop.create_task(link_checker_task.start())
         
         if Telegram.SUBSCRIPTION:
             loop.create_task(subscription_checker_loop(StreamBot))
             LOGGER.info("Subscription Checker Task Started.")
         
-        LOGGER.info("Telegram-Stremio Started Successfully!")
+        LOGGER.info("GDrive-Stremio Started Successfully!")
         await idle()
     except Exception:
         LOGGER.error("Error during startup:\n" + format_exc())
@@ -75,8 +81,6 @@ async def stop_services():
         await asyncio.gather(*pending_tasks, return_exceptions=True)
 
         await StreamBot.stop()
-        await Helper.stop()
-
         await db.disconnect()
         
         LOGGER.info("Services stopped successfully.")

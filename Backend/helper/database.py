@@ -1,6 +1,5 @@
 import secrets
 import string
-from asyncio import create_task
 from bson import ObjectId
 import motor.motor_asyncio
 from datetime import datetime, timezone
@@ -11,9 +10,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from Backend.logger import LOGGER
 from Backend.config import Telegram
 import re
-from Backend.helper.encrypt import decode_string
-from Backend.helper.modal import Episode, MovieSchema, QualityDetail, Season, TVShowSchema
-from Backend.helper.task_manager import delete_message
+from Backend.helper.modal import Episode, MovieSchema, GDriveStream, Season, TVShowSchema
 
 
 def convert_objectid_to_str(document: Dict[str, Any]) -> Dict[str, Any]:
@@ -1532,3 +1529,168 @@ class Database:
 
         updated_doc = await collection.find_one({"tmdb_id": new_tmdb_id})
         return convert_objectid_to_str(updated_doc) if updated_doc else None
+
+    # -------------------------------
+    # GDrive Credential Methods
+    # -------------------------------
+    async def save_gdrive_token(self, pickle_bytes: bytes, uploaded_by: int):
+        """Upsert the token.pickle bytes into the gdrive_credentials collection."""
+        await self.dbs["tracking"]["gdrive_credentials"].replace_one(
+            {"_id": "gdrive_token"},
+            {
+                "_id": "gdrive_token",
+                "pickle_bytes": pickle_bytes,
+                "uploaded_by": uploaded_by,
+                "uploaded_at": datetime.utcnow(),
+            },
+            upsert=True
+        )
+
+    async def load_gdrive_token(self) -> Optional[bytes]:
+        """Load token.pickle bytes from MongoDB. Returns None if not yet uploaded."""
+        doc = await self.dbs["tracking"]["gdrive_credentials"].find_one({"_id": "gdrive_token"})
+        return doc["pickle_bytes"] if doc else None
+
+    async def update_gdrive_token_after_refresh(self, pickle_bytes: bytes):
+        """Update stored token after OAuth2 refresh."""
+        await self.dbs["tracking"]["gdrive_credentials"].update_one(
+            {"_id": "gdrive_token"},
+            {"$set": {"pickle_bytes": pickle_bytes, "refreshed_at": datetime.utcnow()}}
+        )
+
+    async def gdrive_file_exists(self, gdrive_file_id: str) -> bool:
+        """Check if a gdrive file_id is already stored in any stream document."""
+        for i in range(1, self.current_db_index + 1):
+            db = self.dbs[f"storage_{i}"]
+            result = await db["movie"].find_one({"streams.gdrive_file_id": gdrive_file_id})
+            if result:
+                return True
+            result = await db["tv"].find_one({"seasons.episodes.streams.gdrive_file_id": gdrive_file_id})
+            if result:
+                return True
+        return False
+
+    async def count_movies(self) -> int:
+        total = 0
+        for i in range(1, self.current_db_index + 1):
+            total += await self.dbs[f"storage_{i}"]["movie"].count_documents({})
+        return total
+
+    async def count_shows(self) -> int:
+        total = 0
+        for i in range(1, self.current_db_index + 1):
+            total += await self.dbs[f"storage_{i}"]["tv"].count_documents({})
+        return total
+
+    async def upsert_movie_stream(self, tmdb_id: int, stream: dict, meta: dict):
+        """Insert or update a movie with a GDrive stream entry."""
+        current_db_key = f"storage_{self.current_db_index}"
+        total_storage_dbs = len(self.dbs) - 1
+
+        existing = None
+        existing_db_key = None
+        for db_index in range(1, total_storage_dbs + 1):
+            db_key = f"storage_{db_index}"
+            doc = await self.dbs[db_key]["movie"].find_one({"tmdb_id": tmdb_id})
+            if not doc and meta.get("imdb_id"):
+                doc = await self.dbs[db_key]["movie"].find_one({"imdb_id": meta["imdb_id"]})
+            if doc:
+                existing = doc
+                existing_db_key = db_key
+                break
+
+        if not existing:
+            movie_dict = {
+                "tmdb_id": tmdb_id,
+                "imdb_id": meta.get("imdb_id"),
+                "db_index": self.current_db_index,
+                "title": meta.get("title", ""),
+                "genres": meta.get("genres", []),
+                "description": meta.get("description", ""),
+                "rating": meta.get("rate", 0),
+                "release_year": meta.get("year"),
+                "poster": meta.get("poster", ""),
+                "backdrop": meta.get("backdrop", ""),
+                "logo": meta.get("logo", ""),
+                "cast": meta.get("cast", []),
+                "runtime": meta.get("runtime", ""),
+                "media_type": "movie",
+                "updated_on": datetime.utcnow(),
+                "streams": [stream],
+            }
+            await self.dbs[current_db_key]["movie"].insert_one(movie_dict)
+        else:
+            existing.setdefault("streams", [])
+            existing["streams"].append(stream)
+            existing["updated_on"] = datetime.utcnow()
+            await self.dbs[existing_db_key]["movie"].replace_one(
+                {"_id": existing["_id"]}, existing
+            )
+
+    async def upsert_episode_stream(self, tmdb_id: int, season: int, episode: int, stream: dict, meta: dict):
+        """Insert or update a TV show episode with a GDrive stream entry."""
+        current_db_key = f"storage_{self.current_db_index}"
+        total_storage_dbs = len(self.dbs) - 1
+
+        existing = None
+        existing_db_key = None
+        for db_index in range(1, total_storage_dbs + 1):
+            db_key = f"storage_{db_index}"
+            doc = await self.dbs[db_key]["tv"].find_one({"tmdb_id": tmdb_id})
+            if not doc and meta.get("imdb_id"):
+                doc = await self.dbs[db_key]["tv"].find_one({"imdb_id": meta["imdb_id"]})
+            if doc:
+                existing = doc
+                existing_db_key = db_key
+                break
+
+        ep_obj = {
+            "episode_number": episode,
+            "title": meta.get("episode_title", f"S{season}E{episode}"),
+            "episode_backdrop": meta.get("episode_backdrop", ""),
+            "overview": meta.get("episode_overview", ""),
+            "released": meta.get("episode_released", ""),
+            "streams": [stream],
+        }
+
+        if not existing:
+            tv_dict = {
+                "tmdb_id": tmdb_id,
+                "imdb_id": meta.get("imdb_id"),
+                "db_index": self.current_db_index,
+                "title": meta.get("title", ""),
+                "genres": meta.get("genres", []),
+                "description": meta.get("description", ""),
+                "rating": meta.get("rate", 0),
+                "release_year": meta.get("year"),
+                "poster": meta.get("poster", ""),
+                "backdrop": meta.get("backdrop", ""),
+                "logo": meta.get("logo", ""),
+                "cast": meta.get("cast", []),
+                "runtime": meta.get("runtime", ""),
+                "media_type": "tv",
+                "updated_on": datetime.utcnow(),
+                "seasons": [{"season_number": season, "episodes": [ep_obj]}],
+            }
+            await self.dbs[current_db_key]["tv"].insert_one(tv_dict)
+        else:
+            existing_season = next(
+                (s for s in existing.get("seasons", []) if s["season_number"] == season), None
+            )
+            if not existing_season:
+                existing.setdefault("seasons", []).append(
+                    {"season_number": season, "episodes": [ep_obj]}
+                )
+            else:
+                existing_ep = next(
+                    (e for e in existing_season.get("episodes", []) if e["episode_number"] == episode), None
+                )
+                if not existing_ep:
+                    existing_season.setdefault("episodes", []).append(ep_obj)
+                else:
+                    existing_ep.setdefault("streams", []).append(stream)
+
+            existing["updated_on"] = datetime.utcnow()
+            await self.dbs[existing_db_key]["tv"].replace_one(
+                {"_id": existing["_id"]}, existing
+            )

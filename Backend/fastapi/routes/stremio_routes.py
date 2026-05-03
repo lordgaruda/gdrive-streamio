@@ -10,7 +10,7 @@ from Backend.fastapi.security.tokens import verify_token
 
 # --- Configuration ---
 BASE_URL = Telegram.BASE_URL
-ADDON_NAME = "Telegram"
+ADDON_NAME = "GDrive"
 ADDON_VERSION = __version__
 PAGE_SIZE = 15
 
@@ -64,7 +64,8 @@ def format_stream_details(filename: str, quality: str, size: str) -> tuple[str, 
     try:
         parsed = PTN.parse(filename)
     except Exception:
-        return (f"Telegram {quality}", f"📁 {filename}\n💾 {size}")
+        size_str = f"{size / (1024**3):.1f} GB" if isinstance(size, (int, float)) and size > 0 else str(size)
+        return (f"GDrive {quality}", f"📁 {filename}\n💾 {size_str}")
 
     codec_parts = []
     if parsed.get("codec"):
@@ -80,7 +81,7 @@ def format_stream_details(filename: str, quality: str, size: str) -> tuple[str, 
 
     resolution = parsed.get("resolution", quality)
     quality_type = parsed.get("quality", "")
-    stream_name = f"Telegram {resolution} {quality_type}".strip()
+    stream_name = f"GDrive {resolution} {quality_type}".strip()
 
     stream_title_parts = [
         f"📁 {filename}",
@@ -161,7 +162,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
 
     # Build dynamic name/description/version with subscription info
     addon_name = ADDON_NAME
-    addon_desc = "Streams movies and series from your Telegram."
+    addon_desc = "Streams movies and series from Google Drive."
     addon_version = ADDON_VERSION
     expiry_obj = None
 
@@ -548,46 +549,31 @@ async def get_streams(
         episode_number=episode_num
     )
 
-    if not media_details or "telegram" not in media_details:
+    if not media_details or "streams" not in media_details:
         return {"streams": []}
 
     streams = []
-    for quality in media_details.get("telegram", []):
-        if quality.get("id"):
-            filename = quality.get("name", "")
-            quality_str = quality.get("quality", "HD")
-            size = quality.get("size", "")
+    for quality in media_details.get("streams", []):
+        gdrive_file_id = quality.get("gdrive_file_id")
+        if not gdrive_file_id:
+            continue
 
-            stream_name, stream_title = format_stream_details(
-                filename, quality_str, size
-            )
+        filename = quality.get("filename", "")
+        quality_str = quality.get("quality", "HD")
+        raw_size = quality.get("size", 0)
+        size_str = f"{raw_size / (1024**3):.1f} GB" if isinstance(raw_size, (int, float)) and raw_size > 0 else str(raw_size)
 
-            original_url = f"{BASE_URL}/dl/{token}/{quality.get('id')}/video.mkv"
-            proxy_url = f"{Telegram.HTTP_PROXY_URL}{original_url}" if Telegram.PROXY and Telegram.HTTP_PROXY_URL else None
+        stream_name, stream_title = format_stream_details(
+            filename, quality_str, size_str
+        )
 
-            if Telegram.SHOW_PROXY_AND_NON_PROXY_BOTH and proxy_url:
-                streams.append({
-                    "name": f"{stream_name} (Proxy)",
-                    "title": stream_title,
-                    "url": proxy_url
-                })
-                streams.append({
-                    "name": f"{stream_name} (Direct)",
-                    "title": stream_title,
-                    "url": original_url
-                })
-            elif proxy_url:
-                streams.append({
-                    "name": stream_name,
-                    "title": stream_title,
-                    "url": proxy_url
-                })
-            else:
-                streams.append({
-                    "name": stream_name,
-                    "title": stream_title,
-                    "url": original_url
-                })
+        stream_url = f"{BASE_URL}/dl/{gdrive_file_id}/video.mkv"
+
+        streams.append({
+            "name": stream_name,
+            "title": stream_title,
+            "url": stream_url
+        })
 
     streams.sort(
         key=lambda s: get_resolution_priority(s.get("name", "")),

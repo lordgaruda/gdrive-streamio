@@ -2,14 +2,18 @@ from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
+
 # ---------------------------
-# Quality Detail Schema
+# GDrive Stream (replaces Telegram QualityDetail)
 # ---------------------------
-class QualityDetail(BaseModel):
-    quality: str
-    id: str
-    name: str
-    size: str
+class GDriveStream(BaseModel):
+    """Stream quality entry backed by a Google Drive file."""
+    gdrive_file_id: str        # Google Drive file ID (e.g. "1BxiMVs0XRA5...")
+    filename: str              # original filename
+    quality: str               # "1080p", "720p", "4K", "Unknown"
+    size: int                  # file size in bytes
+    mime_type: str             # "video/mp4", "video/x-matroska", etc.
+    added_at: datetime = Field(default_factory=datetime.utcnow)
 
 
 # ---------------------------
@@ -21,7 +25,7 @@ class Episode(BaseModel):
     episode_backdrop: Optional[str] = None
     overview: Optional[str] = None
     released: Optional[str] = None
-    telegram: Optional[List[QualityDetail]]
+    streams: Optional[List[GDriveStream]] = Field(default_factory=list)
 
 
 # ---------------------------
@@ -73,4 +77,18 @@ class MovieSchema(BaseModel):
     runtime: Optional[str] = None
     media_type: str
     updated_on: datetime = Field(default_factory=datetime.utcnow)
-    telegram: Optional[List[QualityDetail]]
+    streams: Optional[List[GDriveStream]] = Field(default_factory=list)
+
+
+# ---------------------------
+# GDrive Credential (token.pickle stored in MongoDB)
+# ---------------------------
+class GDriveCredential(BaseModel):
+    """
+    Stores the binary content of token.pickle in MongoDB.
+    Only one document exists in this collection at a time (upserted by _id).
+    """
+    pickle_bytes: bytes                 # raw binary of token.pickle
+    uploaded_by: int                    # Telegram user_id who sent the file
+    uploaded_at: datetime = Field(default_factory=datetime.utcnow)
+    refreshed_at: Optional[datetime] = None  # updated each time creds are refreshed

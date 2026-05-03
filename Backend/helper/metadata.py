@@ -6,9 +6,7 @@ from re import compile, IGNORECASE
 from Backend.helper.imdb import get_detail, get_season, search_title
 from themoviedb import aioTMDb
 from Backend.config import Telegram
-import Backend
 from Backend.logger import LOGGER
-from Backend.helper.encrypt import encode_string
 
 # ----------------- Configuration -----------------
 DELAY = 0
@@ -199,21 +197,11 @@ async def metadata(filename: str, channel: int, msg_id, override_id: str = None)
             
     if not default_id:
         try:
-            default_id = extract_default_id(Backend.USE_DEFAULT_ID)
-        except Exception:
-            pass
-            
-    if not default_id:
-        try:
             default_id = extract_default_id(filename)
         except Exception:
             pass
 
-    data = {"chat_id": channel, "msg_id": msg_id}
-    try:
-        encoded_string = await encode_string(data)
-    except Exception:
-        encoded_string = None
+    encoded_string = None  # No longer used (GDrive mode)
 
     try:
         if season and episode:

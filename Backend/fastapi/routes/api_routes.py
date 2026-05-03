@@ -11,8 +11,7 @@ from Backend.helper.metadata import (
     fetch_selected_movie_metadata,
     fetch_selected_tv_metadata,
 )
-from Backend.pyrofork.bot import multi_clients, StreamBot
-from Backend.helper.custom_dl import run_speed_test, _speed_test_single_client
+from Backend.pyrofork.bot import StreamBot
 from time import time
 
 
@@ -24,12 +23,13 @@ async def get_system_stats_api():
         total_movies = sum(stat.get("movie_count", 0) for stat in db_stats)
         total_tv_shows = sum(stat.get("tv_count", 0) for stat in db_stats)
         api_tokens = await db.get_all_api_tokens()
+        has_gdrive = await db.load_gdrive_token() is not None
         
         return {
             "server_status": "running",
             "uptime": get_readable_time(time() - StartTime),
             "telegram_bot": f"@{StreamBot.username}" if StreamBot and StreamBot.username else "@StreamBot",
-            "connected_bots": len(multi_clients),
+            "gdrive_connected": has_gdrive,
             "version": __version__,
             "movies": total_movies,
             "tv_shows": total_tv_shows,
@@ -271,193 +271,30 @@ async def revoke_token_api(token: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Speed Test API ---
 
-async def speed_test_api(
-    quality_id: str = Query(..., description="Encoded quality ID from DB"),
-    tmdb_id: int = Query(...),
-    db_index: int = Query(...),
-    media_type: str = Query(..., regex="^(movie|tv)$"),
-):
-    """
-    Decode quality_id using the same decode_string logic as the stream handler,
-    then run a parallel download speed test across all connected bot clients.
-    """
-    from Backend.helper.encrypt import decode_string
+# --- Speed Test API (removed — not applicable in GDrive mode) ---
 
-    try:
-        decoded = await decode_string(quality_id)
-        msg_id  = decoded.get("msg_id")
-        raw_cid = decoded.get("chat_id")
+async def speed_test_api(*args, **kwargs):
+    raise HTTPException(status_code=410, detail="Speed test not available in GDrive mode")
 
-        if not msg_id or not raw_cid:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Decoded quality data is missing msg_id or chat_id. Decoded: {decoded}"
-            )
+async def speed_test_stream_api(*args, **kwargs):
+    raise HTTPException(status_code=410, detail="Speed test not available in GDrive mode")
 
-        # Stream handler adds -100 prefix for channel IDs
-        chat_id = int(f"-100{raw_cid}")
-
-        results = await run_speed_test(int(chat_id), int(msg_id))
-        return {"results": results, "total_clients_tested": len(results)}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# --- Speed Test SSE Streaming API ---
-
-async def speed_test_stream_api(
-    quality_id: str,
-    tmdb_id: int,
-    db_index: int,
-    media_type: str,
-):
-    """
-    SSE version of the speed test. Streams each per-client result as a
-    'data:' event the moment that client finishes, so the UI can update live.
-    """
-    from Backend.helper.encrypt import decode_string
-
-    async def event_generator():
-        # Decode quality_id → chat_id + message_id
-        try:
-            decoded = await decode_string(quality_id)
-            msg_id  = decoded.get("msg_id")
-            raw_cid = decoded.get("chat_id")
-            if not msg_id or not raw_cid:
-                payload = json.dumps({"type": "error", "message": f"Cannot decode quality_id. Got: {decoded}"})
-                yield f"data: {payload}\n\n"
-                return
-            chat_id = int(f"-100{raw_cid}")
-        except Exception as exc:
-            payload = json.dumps({"type": "error", "message": str(exc)})
-            yield f"data: {payload}\n\n"
-            return
-
-        total = len(multi_clients)
-        if total == 0:
-            payload = json.dumps({"type": "error", "message": "No bot clients connected"})
-            yield f"data: {payload}\n\n"
-            return
-            
-        # Try to resolve the FileId to get the target DC
-        target_dc = "?"
-        try:
-            from Backend.helper.custom_dl import ByteStreamer
-            primary_client = multi_clients.get(0) or next(iter(multi_clients.values()))
-            streamer = ByteStreamer(primary_client)
-            file_id = await streamer.get_file_properties(chat_id, int(msg_id))
-            target_dc = file_id.dc_id
-        except Exception:
-            pass
-
-        # Send initial "start" event so the frontend can set up the table
-        yield f"data: {json.dumps({'type': 'start', 'total': total, 'target_dc': target_dc})}\n\n"
-
-        # Run all clients in parallel; feed results into a queue as they finish
-        queue: asyncio.Queue = asyncio.Queue()
-
-        async def run_one(client, idx):
-            async def on_progress(prog_data):
-                await queue.put({"type": "progress", "data": prog_data})
-                
-            result = await _speed_test_single_client(
-                client, idx, chat_id, int(msg_id), progress_callback=on_progress
-            )
-            await queue.put({"type": "result", "data": result})
-
-        tasks = [
-            asyncio.create_task(run_one(client, idx))
-            for idx, client in multi_clients.items()
-        ]
-
-        completed = 0
-        while completed < total:
-            msg = await queue.get()
-            
-            if msg["type"] == "progress":
-                payload = json.dumps(msg)
-                yield f"data: {payload}\n\n"
-            
-            elif msg["type"] == "result":
-                completed += 1
-                payload = json.dumps({
-                    "type": "result",
-                    "data": msg["data"],
-                    "completed": completed,
-                    "total": total,
-                })
-                yield f"data: {payload}\n\n"
-
-        # Wait for any remaining tasks (should already be done)
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Final done event
-        yield f"data: {json.dumps({'type': 'done', 'total': total})}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # prevent nginx from buffering SSE
-        },
-    )
 
 # ---------------------------------------------------------------------------
 # Admin API Routes
 # ---------------------------------------------------------------------------
 
 async def get_admin_stats_api() -> dict:
-    from Backend.pyrofork.bot import work_loads, multi_clients, client_failures, client_avg_mbps
-    from Backend.fastapi.routes.stream_routes import _streamer_by_client
-    
-    # Sum cache entries across all active ByteStreamer instances
-    cache_size = sum(len(s._file_id_cache) for s in _streamer_by_client.values())
-    
-    # Calculate bot workloads and health
-    bot_stats = []
-    for client_index in multi_clients:
-        load = work_loads.get(client_index, 0)
-        failures = client_failures.get(client_index, 0)
-        mbps = client_avg_mbps.get(client_index, 0.0)
-        
-        status = "healthy"
-        if failures > 5:
-            status = "degraded"
-        if failures > 15:
-            status = "failing"
-            
-        bot_stats.append({
-            "client_index": client_index,
-            "display_name": f"Bot {client_index + 1}",
-            "current_load": load,
-            "failures": failures,
-            "avg_mbps": round(mbps, 2),
-            "status": status
-        })
-        
+    has_gdrive = await db.load_gdrive_token() is not None
     return {
-        "cache_size": cache_size,
-        "total_bots": len(multi_clients),
-        "bot_workloads": bot_stats
+        "gdrive_connected": has_gdrive,
+        "movies": await db.count_movies(),
+        "tv_shows": await db.count_shows(),
     }
 
 async def clear_cache_api() -> dict:
-    from Backend.fastapi.routes.stream_routes import _streamer_by_client
-    from Backend.logger import LOGGER
-    
-    # Clear cache across all active ByteStreamer instances
-    total_cleared = sum(len(s._file_id_cache) for s in _streamer_by_client.values())
-    for streamer in _streamer_by_client.values():
-        streamer._file_id_cache.clear()
-    LOGGER.info(f"Admin cleared the FileId cache ({total_cleared} items purged across {len(_streamer_by_client)} clients).")
-    
-    return {"status": "success", "message": f"{total_cleared} cached items cleared."}
+    return {"status": "success", "message": "No cache to clear (GDrive mode)."}
 
 async def get_dead_links_api() -> dict:
     from Backend import db
