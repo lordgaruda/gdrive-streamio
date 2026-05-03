@@ -6,6 +6,8 @@
   A powerful, self-hosted <b>Google Drive Stremio Media Server</b> built with <b>FastAPI</b>, <b>MongoDB</b>, and <b>Google Drive APIs</b> — seamlessly integrated with <b>Stremio</b> for automated media streaming and discovery.
 </p>
 
+> ⚠️ **IMPORTANT NOTE:** Web browsers do not natively support streaming `.mkv` files. To play MKV files seamlessly from Google Drive, **you must use the Stremio Desktop or Mobile App**, which includes built-in libVLC support for MKV decoding.
+
 <p align="center">
   <img src="https://img.shields.io/badge/UV%20Package%20Manager-2B7A77?logo=uv&logoColor=white" alt="UV Package Manager" />
   <img src="https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white" alt="Python" />
