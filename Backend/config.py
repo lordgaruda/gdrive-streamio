@@ -27,6 +27,7 @@ class Telegram:
     ADMIN_USERNAME = getenv("ADMIN_USERNAME", "fyvio")
     ADMIN_PASSWORD = getenv("ADMIN_PASSWORD", "fyvio")
     
+    HIDE_CATALOG = getenv("HIDE_CATALOG", "false").lower() == "true"
     SUBSCRIPTION = getenv("SUBSCRIPTION", "false").lower() == "true"
     SUBSCRIPTION_GROUP_ID = int(getenv("SUBSCRIPTION_GROUP_ID", "0"))
     SUBSCRIPTION_URL = getenv("SUBSCRIPTION_URL", "https://t.me/")
