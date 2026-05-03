@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 import httpx
 import pickle
 import logging
+import asyncio
 from Backend import db
 from google.auth.transport.requests import Request as GRequest
 
@@ -19,6 +20,20 @@ CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
     "Access-Control-Expose-Headers": "Content-Range, Content-Length, Accept-Ranges",
 }
+
+# Reusable httpx client — connection pooling avoids per-request TLS handshakes
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            follow_redirects=True,
+        )
+    return _client
 
 
 async def get_fresh_token() -> str:
@@ -43,18 +58,40 @@ async def stream_options(file_id: str):
 async def stream_head(file_id: str):
     """Stremio Web probes with HEAD before starting playback."""
     token = await get_fresh_token()
-    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=size,mimeType,name&supportsAllDrives=true"
 
-    async with httpx.AsyncClient() as client:
-        resp = await client.head(url, headers={"Authorization": f"Bearer {token}"})
+    client = _get_client()
+    resp = await client.get(url, headers={"Authorization": f"Bearer {token}"})
+
+    if resp.status_code != 200:
+        return Response(status_code=404, content="File not found", headers=CORS_HEADERS)
+
+    meta = resp.json()
+    file_size = int(meta.get("size", 0))
+    mime_type = _resolve_mime(meta)
 
     headers = {
         **CORS_HEADERS,
         "Accept-Ranges": "bytes",
-        "Content-Length": resp.headers.get("Content-Length", "0"),
-        "Content-Type": resp.headers.get("Content-Type", "video/mp4"),
+        "Content-Length": str(file_size),
+        "Content-Type": mime_type,
     }
     return Response(status_code=200, headers=headers)
+
+
+def _resolve_mime(meta: dict) -> str:
+    """Resolve MIME type from GDrive metadata, falling back to extension."""
+    mime_type = meta.get("mimeType", "video/mp4")
+    if mime_type == "application/octet-stream":
+        name = meta.get("name", "")
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        mime_map = {
+            "mkv": "video/x-matroska", "mp4": "video/mp4",
+            "avi": "video/x-msvideo", "webm": "video/webm",
+            "ts": "video/mp2t", "m4v": "video/mp4",
+        }
+        mime_type = mime_map.get(ext, "video/mp4")
+    return mime_type
 
 
 @router.get("/dl/{file_id}/video.mkv")
@@ -65,8 +102,8 @@ async def stream_gdrive(file_id: str, request: Request):
 
     # Get file metadata for size + mime
     meta_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=size,mimeType,name&supportsAllDrives=true"
-    async with httpx.AsyncClient() as client:
-        meta_resp = await client.get(meta_url, headers={"Authorization": f"Bearer {token}"})
+    client = _get_client()
+    meta_resp = await client.get(meta_url, headers={"Authorization": f"Bearer {token}"})
 
     if meta_resp.status_code != 200:
         return Response(
@@ -77,15 +114,8 @@ async def stream_gdrive(file_id: str, request: Request):
 
     meta = meta_resp.json()
     file_size = int(meta.get("size", 0))
-    mime_type = meta.get("mimeType", "video/mp4")
-
-    # Normalize MIME for browser playback
-    if mime_type == "application/octet-stream":
-        name = meta.get("name", "")
-        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        mime_map = {"mkv": "video/x-matroska", "mp4": "video/mp4",
-                    "avi": "video/x-msvideo", "webm": "video/webm"}
-        mime_type = mime_map.get(ext, "video/mp4")
+    mime_type = _resolve_mime(meta)
+    filename = meta.get("name", "video")
 
     range_header = request.headers.get("Range")
 
@@ -94,8 +124,20 @@ async def stream_gdrive(file_id: str, request: Request):
             range_val = range_header.replace("bytes=", "").strip()
             start_str, _, end_str = range_val.partition("-")
             start = int(start_str) if start_str else 0
-            end = int(end_str) if end_str else min(start + 10_000_000, file_size - 1)
+            # Serve the full remaining file if end is unspecified — don't cap.
+            # Stremio and most players expect the full range to be available.
+            end = int(end_str) if end_str else file_size - 1
             end = min(end, file_size - 1)
+
+            if start > end or start >= file_size:
+                return Response(
+                    status_code=416,
+                    content="Range Not Satisfiable",
+                    headers={
+                        **CORS_HEADERS,
+                        "Content-Range": f"bytes */{file_size}",
+                    },
+                )
         except Exception:
             return Response(status_code=416, content="Invalid Range header", headers=CORS_HEADERS)
 
@@ -104,13 +146,18 @@ async def stream_gdrive(file_id: str, request: Request):
         async def generate():
             try:
                 fresh_token = await get_fresh_token()
-                async with httpx.AsyncClient(timeout=60) as client:
-                    async with client.stream(
-                        "GET", download_url,
-                        headers={"Authorization": f"Bearer {fresh_token}", "Range": f"bytes={start}-{end}"}
-                    ) as resp:
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
-                            yield chunk
+                cl = _get_client()
+                async with cl.stream(
+                    "GET", download_url,
+                    headers={
+                        "Authorization": f"Bearer {fresh_token}",
+                        "Range": f"bytes={start}-{end}",
+                    },
+                ) as resp:
+                    async for data in resp.aiter_bytes(chunk_size=262144):
+                        yield data
+            except (GeneratorExit, asyncio.CancelledError):
+                log.debug(f"Client disconnected for {file_id} (range {start}-{end})")
             except Exception as e:
                 log.error(f"Stream error for {file_id}: {e}")
 
@@ -123,19 +170,25 @@ async def stream_gdrive(file_id: str, request: Request):
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(chunk_size),
-                "Content-Disposition": f'inline; filename="{meta.get("name", "video")}"',
-            }
+                "Content-Disposition": f'inline; filename="{filename}"',
+            },
         )
     else:
+        # Full file download — no Range header
         async def generate_full():
-            fresh_token = await get_fresh_token()
-            async with httpx.AsyncClient(timeout=120) as client:
-                async with client.stream(
+            try:
+                fresh_token = await get_fresh_token()
+                cl = _get_client()
+                async with cl.stream(
                     "GET", download_url,
-                    headers={"Authorization": f"Bearer {fresh_token}"}
+                    headers={"Authorization": f"Bearer {fresh_token}"},
                 ) as resp:
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
-                        yield chunk
+                    async for data in resp.aiter_bytes(chunk_size=262144):
+                        yield data
+            except (GeneratorExit, asyncio.CancelledError):
+                log.debug(f"Client disconnected for {file_id} (full download)")
+            except Exception as e:
+                log.error(f"Stream error for {file_id}: {e}")
 
         return StreamingResponse(
             generate_full(),
@@ -145,5 +198,6 @@ async def stream_gdrive(file_id: str, request: Request):
                 **CORS_HEADERS,
                 "Accept-Ranges": "bytes",
                 "Content-Length": str(file_size),
-            }
+                "Content-Disposition": f'inline; filename="{filename}"',
+            },
         )
