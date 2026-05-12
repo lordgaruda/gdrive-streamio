@@ -55,10 +55,10 @@ async def receive_token_pickle(client: Client, message: Message):
         "Starting initial scan — use /scanstatus to check progress."
     )
 
-    # Trigger initial scan
+    # Trigger initial full scan (always full for new token)
     from Backend.gdrive.ingest import run_full_ingest
     import asyncio
-    asyncio.create_task(run_full_ingest())
+    asyncio.create_task(run_full_ingest(force_full=True))
 
 
 @Client.on_message(admin_filter & filters.command("scanstatus"))
@@ -68,20 +68,32 @@ async def scan_status(client: Client, message: Message):
     movies = await db.count_movies()
     shows = await db.count_shows()
     token_exists = await db.load_gdrive_token() is not None
+    last_scan = await db.load_gdrive_last_scan()
+    last_scan_str = last_scan.strftime("%Y-%m-%d %H:%M UTC") if last_scan else "Never"
     await message.reply(
         f"**Google Drive Token:** {'✅ Connected' if token_exists else '❌ NOT uploaded'}\n"
         f"**Movies indexed:** {movies}\n"
-        f"**TV Shows indexed:** {shows}"
+        f"**TV Shows indexed:** {shows}\n"
+        f"**Last scan:** {last_scan_str}"
     )
 
 
 @Client.on_message(admin_filter & filters.command("rescan"))
 async def trigger_rescan(client: Client, message: Message):
-    """Manually trigger a Google Drive rescan."""
+    """Manually trigger a Google Drive rescan.
+    /rescan — incremental (only new/modified files)
+    /rescan full — force a complete full rescan
+    """
     from Backend.gdrive.ingest import run_full_ingest
     import asyncio
-    await message.reply("🔄 Rescan started. Use /scanstatus to monitor.")
-    asyncio.create_task(run_full_ingest())
+    parts = message.text.strip().split()
+    force_full = len(parts) > 1 and parts[1].lower() == "full"
+    if force_full:
+        await message.reply("🔄 Full rescan started (scanning ALL files). Use /scanstatus to monitor.")
+    else:
+        await message.reply("🔄 Incremental rescan started (only new/modified files). Use /scanstatus to monitor.\n"
+                            "💡 Use `/rescan full` to force a complete rescan.")
+    asyncio.create_task(run_full_ingest(force_full=force_full))
 
 
 @Client.on_message(admin_filter & filters.command("start"))
@@ -90,5 +102,6 @@ async def start(client: Client, message: Message):
         "**GDrive Stremio Bot — Admin Commands:**\n\n"
         "📎 Send `token.pickle` file → uploads Google Drive credentials\n"
         "📊 /scanstatus — show indexing status\n"
-        "🔄 /rescan — trigger a manual Drive rescan"
+        "🔄 /rescan — incremental scan (new/modified files only)\n"
+        "🔄 /rescan full — force a complete full rescan"
     )

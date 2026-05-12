@@ -1558,6 +1558,19 @@ class Database:
             {"$set": {"pickle_bytes": pickle_bytes, "refreshed_at": datetime.utcnow()}}
         )
 
+    async def save_gdrive_last_scan(self, scan_time: datetime):
+        """Save the timestamp of the last successful GDrive scan."""
+        await self.dbs["tracking"]["gdrive_credentials"].update_one(
+            {"_id": "gdrive_scan_state"},
+            {"$set": {"last_scan": scan_time, "updated_at": datetime.utcnow()}},
+            upsert=True,
+        )
+
+    async def load_gdrive_last_scan(self) -> Optional[datetime]:
+        """Load the timestamp of the last successful GDrive scan. Returns None if never scanned."""
+        doc = await self.dbs["tracking"]["gdrive_credentials"].find_one({"_id": "gdrive_scan_state"})
+        return doc["last_scan"] if doc else None
+
     async def gdrive_file_exists(self, gdrive_file_id: str) -> bool:
         """Check if a gdrive file_id is already stored in any stream document."""
         for i in range(1, self.current_db_index + 1):

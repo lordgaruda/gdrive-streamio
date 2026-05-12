@@ -31,10 +31,14 @@ async def start_services():
         await setup_bot_commands(StreamBot)
         await asleep(1)
 
-        # Start GDrive scheduled scanning
+        # Start GDrive initial scanning (incremental if previously scanned)
         token = await db.load_gdrive_token()
         if token:
-            LOGGER.info("token.pickle found in DB — starting initial Drive scan")
+            last_scan = await db.load_gdrive_last_scan()
+            if last_scan:
+                LOGGER.info(f"token.pickle found — starting incremental Drive scan (last scan: {last_scan.isoformat()})")
+            else:
+                LOGGER.info("token.pickle found — starting initial full Drive scan")
             from Backend.gdrive.ingest import run_full_ingest
             loop.create_task(run_full_ingest())
         else:
