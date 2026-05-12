@@ -567,7 +567,8 @@ async def get_streams(
             filename, quality_str, size_str
         )
 
-        stream_url = f"{BASE_URL}/dl/{gdrive_file_id}/video.mkv"
+        # Use .mp4 endpoint for browser compatibility (handles MKV remuxing)
+        stream_url = f"{BASE_URL}/dl/{gdrive_file_id}/video.mp4"
 
         streams.append({
             "name": stream_name,
